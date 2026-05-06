@@ -78,6 +78,14 @@ flowchart TD
 
 Meridian should be boring where network software must be boring.
 
+If browsing stalls after a test run, use the emergency rollback command:
+
+```sh
+python3 -m meridian_stabilizer panic --service
+```
+
+It unloads Meridian's background service and clears only Meridian-owned PF/dnctl state.
+
 | Contract | Implementation |
 | --- | --- |
 | No fake data | Dashboard, reports, events, and recommendations use live local measurements or prior real local samples. |
@@ -171,13 +179,17 @@ Run the stabilizer and guardian together in the foreground:
 python3 -m meridian_stabilizer run --profile calls --guardian
 ```
 
-Install the background stabilizer with guardian auto-shutdown and Mac notifications:
+Install Meridian's service files with guardian configuration and Mac notifications:
 
 ```sh
 python3 -m meridian_stabilizer install
 ```
 
-That one command runs preflight checks, installs the launchd service, enables the `calls` profile, enables guardian shutdown, and installs the user notification bridge.
+That command runs preflight checks, installs the launchd service file, leaves shaping stopped, and installs the user notification bridge. To start shaping immediately as part of installation, opt in explicitly:
+
+```sh
+python3 -m meridian_stabilizer install --start-now
+```
 
 Incident reports are written under:
 
@@ -202,13 +214,13 @@ Requirements:
 - Python 3.11+
 - Built-in macOS commands: `route`, `ping`, `networkQuality`, `pfctl`, `dnctl`, `launchctl`
 
-Run one command from the repository root:
+Run one safe install command from the repository root:
 
 ```sh
 python3 -m meridian_stabilizer install
 ```
 
-This is the production default. It installs the background watcher with guardian auto-shutdown and the user notification bridge. macOS may ask for an administrator password because Meridian installs a launchd service and applies network shaping through PF/dummynet.
+This installs Meridian without turning on PF/dummynet shaping. macOS may ask for an administrator password because Meridian writes a launchd service file.
 
 After installation, check it with:
 
@@ -218,7 +230,7 @@ python3 -m meridian_stabilizer service-status
 
 ## First Run
 
-For normal use, the install command above is the first run.
+For normal use, the install command above is the first run. It should not slow the Mac down because it leaves shaping inactive until you explicitly start it.
 
 Manual inspection remains available and does not shape traffic.
 
@@ -280,7 +292,7 @@ python3 -m meridian_stabilizer panic
 | `stop` | Removes Meridian-owned shaping. |
 | `panic` | Fast rollback path for owned shaping and local active state. |
 | `service-status` | Shows launchd state for the root service and user notification bridge. |
-| `install` | One-command production install: preflight, service, guardian, and notifications. |
+| `install` | Safe install: preflight, service file, guardian configuration, and notifications; shaping starts only with `--start-now`. |
 | `install-service` | Installs the launchd-backed CLI watcher. |
 | `uninstall-service` | Removes the launchd service. |
 | `install-notifier` | Installs only the user notification bridge. |
@@ -360,13 +372,13 @@ This codebase does not send metrics to a server. The current product is local-on
 
 ## Background Mode
 
-The default background install is one command:
+The default background install is one safe command:
 
 ```sh
 python3 -m meridian_stabilizer install
 ```
 
-It installs the launchd-backed watcher, enables guardian auto-shutdown, and installs the user notification bridge. Lower-level commands such as `install-service` and `install-notifier` exist for operators who need custom service control.
+It installs the launchd service file, configures guardian auto-shutdown for future service runs, and installs the user notification bridge. It does not start shaping unless you pass `--start-now`. Lower-level commands such as `install-service` and `install-notifier` exist for operators who need custom service control.
 
 Inspect launchd state:
 
@@ -394,7 +406,7 @@ python3 -m meridian_stabilizer start --profile calls --dry-run
 Start with manual caps:
 
 ```sh
-python3 -m meridian_stabilizer start --profile calls --upload-mbps 8 --download-mbps 25
+python3 -m meridian_stabilizer start --profile calls --upload-mbps 12 --download-mbps 250
 ```
 
 Inspect system shaper state:

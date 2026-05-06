@@ -11,6 +11,12 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(caps.upload_mbps, 35.611)
         self.assertEqual(caps.download_mbps, 301.225)
 
+    def test_initial_caps_without_measurement_avoid_low_download_fallback(self):
+        caps = initial_caps(None, CALLS_PROFILE)
+
+        self.assertEqual(caps.upload_mbps, 12.0)
+        self.assertEqual(caps.download_mbps, 250.0)
+
     def test_profiles_include_production_modes(self):
         self.assertEqual(profile_names(), ["auto", "calls", "downloads", "gaming"])
         self.assertEqual(get_profile("gaming").description.startswith("Favor"), True)

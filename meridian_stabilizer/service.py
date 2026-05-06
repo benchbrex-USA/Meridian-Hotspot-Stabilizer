@@ -3,6 +3,7 @@ from __future__ import annotations
 import plistlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,31 +14,37 @@ from .constants import NOTIFIER_PLIST_LABEL, NOTIFIER_PLIST_PATH, PLIST_LABEL, P
 from .system import CommandRunner
 
 
-def build_launchd_plist(profile: str = "calls", interval: int = 60, guardian: bool = False) -> dict[str, object]:
+def build_launchd_plist(
+    profile: str = "calls",
+    interval: int = 60,
+    guardian: bool = False,
+    start_immediately: bool = True,
+) -> dict[str, object]:
     state_dir = default_state_dir()
+    runtime_dir = runtime_root(state_dir)
     python = Path(sys.executable)
-    program_arguments = [
-        str(python),
-        "-m",
-        "meridian_stabilizer",
+    program_arguments = _python_cli_arguments(
+        python,
+        runtime_dir,
         "run",
         "--profile",
         profile,
         "--interval",
         str(interval),
-    ]
+    )
     if guardian:
         program_arguments.append("--guardian")
     return {
         "Label": PLIST_LABEL,
         "ProgramArguments": program_arguments,
-        "WorkingDirectory": str(project_root()),
+        "WorkingDirectory": str(runtime_dir),
         "EnvironmentVariables": {
             "MERIDIAN_STATE_DIR": str(state_dir),
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
         },
-        "RunAtLoad": True,
-        "KeepAlive": {"SuccessfulExit": False},
+        "RunAtLoad": start_immediately,
+        "KeepAlive": {"SuccessfulExit": False} if start_immediately else False,
         "ThrottleInterval": 30,
         "ExitTimeOut": 10,
         "ProcessType": "Background",
@@ -48,21 +55,22 @@ def build_launchd_plist(profile: str = "calls", interval: int = 60, guardian: bo
 
 def build_notifier_launchd_plist(interval: int = 5) -> dict[str, object]:
     state_dir = default_state_dir()
+    runtime_dir = runtime_root(state_dir)
     python = Path(sys.executable)
     return {
         "Label": NOTIFIER_PLIST_LABEL,
-        "ProgramArguments": [
-            str(python),
-            "-m",
-            "meridian_stabilizer",
+        "ProgramArguments": _python_cli_arguments(
+            python,
+            runtime_dir,
             "notify-drain",
             "--watch",
             "--interval",
             str(max(2, interval)),
-        ],
-        "WorkingDirectory": str(project_root()),
+        ),
+        "WorkingDirectory": str(runtime_dir),
         "EnvironmentVariables": {
             "MERIDIAN_STATE_DIR": str(state_dir),
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONUNBUFFERED": "1",
         },
         "RunAtLoad": True,
@@ -75,22 +83,31 @@ def build_notifier_launchd_plist(interval: int = 5) -> dict[str, object]:
     }
 
 
-def install_service(profile: str = "calls", interval: int = 60, runner: CommandRunner | None = None, guardian: bool = False) -> Path:
+def install_service(
+    profile: str = "calls",
+    interval: int = 60,
+    runner: CommandRunner | None = None,
+    guardian: bool = False,
+    start_immediately: bool = True,
+) -> Path:
     runner = runner or CommandRunner()
     state_dir = default_state_dir()
     if not runner.dry_run:
         state_dir.mkdir(parents=True, exist_ok=True)
-    plist = build_launchd_plist(profile=profile, interval=interval, guardian=guardian)
+        sync_runtime(state_dir)
+    plist = build_launchd_plist(profile=profile, interval=interval, guardian=guardian, start_immediately=start_immediately)
     with tempfile.NamedTemporaryFile("wb", delete=False) as handle:
         plistlib.dump(plist, handle)
         temp_path = Path(handle.name)
     try:
         runner.run(["install", "-o", "root", "-g", "wheel", "-m", "644", str(temp_path), str(PLIST_PATH)], privileged=True, timeout=30)
         runner.run(["launchctl", "bootout", "system", str(PLIST_PATH)], privileged=True, check=False, timeout=30)
-        runner.run(["launchctl", "bootstrap", "system", str(PLIST_PATH)], privileged=True, timeout=30)
-        runner.run(["launchctl", "enable", f"system/{PLIST_LABEL}"], privileged=True, check=False, timeout=30)
-        runner.run(["launchctl", "kickstart", "-k", f"system/{PLIST_LABEL}"], privileged=True, check=False, timeout=30)
-        runner.run(["launchctl", "print", f"system/{PLIST_LABEL}"], privileged=True, check=False, timeout=30)
+        if start_immediately:
+            runner.run(["launchctl", "bootstrap", "system", str(PLIST_PATH)], privileged=True, timeout=30)
+            runner.run(["launchctl", "enable", f"system/{PLIST_LABEL}"], privileged=True, check=False, timeout=30)
+            runner.run(["launchctl", "print", f"system/{PLIST_LABEL}"], privileged=True, check=False, timeout=30)
+        else:
+            runner.run(["launchctl", "disable", f"system/{PLIST_LABEL}"], privileged=True, check=False, timeout=30)
     finally:
         try:
             temp_path.unlink()
@@ -113,6 +130,7 @@ def install_notifier(interval: int = 5, runner: CommandRunner | None = None) -> 
     if not runner.dry_run:
         state_dir.mkdir(parents=True, exist_ok=True)
         NOTIFIER_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        sync_runtime(state_dir)
     plist = build_notifier_launchd_plist(interval=interval)
     with tempfile.NamedTemporaryFile("wb", delete=False) as handle:
         plistlib.dump(plist, handle)
@@ -122,7 +140,6 @@ def install_notifier(interval: int = 5, runner: CommandRunner | None = None) -> 
         runner.run(["launchctl", "bootout", "gui/%s" % _uid(), str(NOTIFIER_PLIST_PATH)], check=False, timeout=30)
         runner.run(["launchctl", "bootstrap", "gui/%s" % _uid(), str(NOTIFIER_PLIST_PATH)], timeout=30)
         runner.run(["launchctl", "enable", f"gui/{_uid()}/{NOTIFIER_PLIST_LABEL}"], check=False, timeout=30)
-        runner.run(["launchctl", "kickstart", "-k", f"gui/{_uid()}/{NOTIFIER_PLIST_LABEL}"], check=False, timeout=30)
         runner.run(["launchctl", "print", f"gui/{_uid()}/{NOTIFIER_PLIST_LABEL}"], check=False, timeout=30)
     finally:
         try:
@@ -210,3 +227,50 @@ def _extract_int(output: str, key: str) -> int | None:
 
 def _uid() -> str:
     return str(os.getuid())
+
+
+def runtime_root(state_dir: Path | None = None) -> Path:
+    return Path("/Users/Shared/meridian-hotspot-stabilizer/runtime")
+
+
+def sync_runtime(state_dir: Path | None = None) -> Path:
+    destination = runtime_root(state_dir)
+    source_package = project_root() / "meridian_stabilizer"
+    destination_package = destination / "meridian_stabilizer"
+    destination.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source_package, destination_package, ignore=_ignore_runtime_junk, copy_function=_copy_runtime_file, dirs_exist_ok=True)
+    _chmod_runtime(destination)
+    return destination
+
+
+def _ignore_runtime_junk(directory: str, names: list[str]) -> set[str]:
+    return {name for name in names if name == "__pycache__" or name == ".DS_Store" or name.startswith("._") or name.endswith(".pyc")}
+
+
+def _copy_runtime_file(source: str, destination: str) -> str:
+    shutil.copyfile(source, destination)
+    os.chmod(destination, 0o644)
+    return destination
+
+
+def _chmod_runtime(root: Path) -> None:
+    for path in [root, *root.rglob("*")]:
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            if path.is_dir():
+                os.chmod(path, 0o755)
+            elif path.is_file():
+                os.chmod(path, 0o644)
+        except PermissionError:
+            continue
+
+
+def _python_cli_arguments(python: Path, runtime_dir: Path, *args: str) -> list[str]:
+    bootstrap = (
+        "import sys; "
+        f"sys.path.insert(0, {str(runtime_dir)!r}); "
+        "from meridian_stabilizer.cli import main; "
+        "raise SystemExit(main(sys.argv[1:]))"
+    )
+    return [str(python), "-c", bootstrap, *args]

@@ -69,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.set_defaults(func=cmd_start)
 
     run = sub.add_parser("run", help="Start shaping and keep the adaptive tuner running in the foreground.")
-    add_start_args(run)
+    add_start_args(run, include_target=False)
     run.add_argument("--interval", type=int, default=60, help="Adaptive tune interval in seconds.")
     run.add_argument("--target", default="1.1.1.1", help="Internet probe target for ping diagnostics.")
     run.add_argument("--quality-every", type=int, default=900, help="Run networkQuality every N seconds while watching.")
@@ -157,11 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
     svc_status.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     svc_status.set_defaults(func=cmd_service_status)
 
-    install = sub.add_parser("install", help="One-command production install: preflight, service, guardian, and notifications.")
+    install = sub.add_parser("install", help="Install service files safely; shaping starts only with --start-now.")
     install.add_argument("--profile", default="calls", choices=profile_names())
     install.add_argument("--interval", type=int, default=60, help="Background tune interval in seconds.")
     install.add_argument("--no-guardian", dest="guardian", action="store_false", help="Install without guardian auto-shutdown.")
     install.add_argument("--no-notifier", dest="notifier", action="store_false", help="Install without the user notification bridge.")
+    install.add_argument("--start-now", action="store_true", help="Immediately start the privileged background shaper after installing.")
     install.add_argument("--skip-preflight", action="store_true", help="Skip readiness checks before installing.")
     install.add_argument("--dry-run", action="store_true", help="Show install commands without applying them.")
     install.set_defaults(func=cmd_install, guardian=True, notifier=True)
@@ -197,11 +198,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def add_start_args(parser: argparse.ArgumentParser) -> None:
+def add_start_args(parser: argparse.ArgumentParser, include_target: bool = True) -> None:
     parser.add_argument("--profile", default="calls", choices=profile_names())
     parser.add_argument("--upload-mbps", type=float, help="Override upload cap.")
     parser.add_argument("--download-mbps", type=float, help="Override download cap.")
     parser.add_argument("--no-measure", action="store_true", help="Use fallback or provided caps without networkQuality.")
+    if include_target:
+        parser.add_argument("--target", default="1.1.1.1", help="Internet probe target for post-apply safety checks.")
+    parser.add_argument("--no-safety-check", action="store_true", help="Skip the post-apply rollback probe.")
     parser.add_argument("--skip-preflight", action="store_true", help="Skip startup preflight checks.")
     parser.add_argument("--dry-run", action="store_true", help="Show commands and rules without applying them.")
 
@@ -284,6 +288,39 @@ def cmd_start(args: argparse.Namespace) -> int:
     runner = CommandRunner(dry_run=args.dry_run)
     shaper = Shaper(runner)
     pf_token = shaper.apply(route.interface, caps, existing_pf_token=state.pf_token if state.active else None)
+
+    if not args.dry_run and not getattr(args, "no_safety_check", False):
+        safety_snapshot = collect_runtime_snapshot(include_quality=False, ping_count=3, target=getattr(args, "target", "1.1.1.1"))
+        safety_failure = _post_apply_safety_failure(safety_snapshot)
+        if safety_failure:
+            Shaper().clear(pf_token=pf_token or state.pf_token)
+            state.active = False
+            state.interface = route.interface
+            state.gateway = route.gateway
+            state.upload_cap_mbps = caps.upload_mbps
+            state.download_cap_mbps = caps.download_mbps
+            state.measured_upload_mbps = quality.upload_mbps if quality else state.measured_upload_mbps
+            state.measured_download_mbps = quality.download_mbps if quality else state.measured_download_mbps
+            state.pf_token = None
+            state.run_pid = None
+            state.last_action = f"start rolled back: {safety_failure}"
+            state.stopped_at = utc_now()
+            store.save(state)
+            db.record_event(
+                "start-rollback",
+                safety_failure,
+                {
+                    "profile": args.profile,
+                    "interface": route.interface,
+                    "gateway": route.gateway,
+                    "upload_cap_mbps": caps.upload_mbps,
+                    "download_cap_mbps": caps.download_mbps,
+                    "probe_errors": list(safety_snapshot.errors),
+                },
+            )
+            print(f"Start rolled back: {safety_failure}", file=sys.stderr)
+            print("Meridian cleared its PF/dnctl rules so the Mac is back on the normal network path.", file=sys.stderr)
+            return 1
 
     state = StabilizerState(
         active=not args.dry_run,
@@ -737,35 +774,39 @@ def cmd_install(args: argparse.Namespace) -> int:
             return 1
 
     runner = CommandRunner(dry_run=args.dry_run)
-    service_path = install_service(profile=args.profile, interval=max(15, args.interval), runner=runner, guardian=args.guardian)
+    service_path = install_service(profile=args.profile, interval=max(15, args.interval), runner=runner, guardian=args.guardian, start_immediately=args.start_now)
     notifier_path = install_notifier(runner=runner) if args.notifier else None
 
     if args.dry_run:
-        print("Dry run: one-command install would run:")
+        print("Dry run: safe install would run:")
         for command in runner.commands:
             print("  " + " ".join(command))
         return 0
 
     MetricsDB().record_event(
         "install",
-        "one-command production install completed",
+        "safe install completed",
         {
             "profile": args.profile,
             "interval": args.interval,
             "guardian": args.guardian,
             "notifier": args.notifier,
+            "start_now": args.start_now,
             "service_path": str(service_path),
             "notifier_path": str(notifier_path) if notifier_path else None,
         },
     )
     print("Meridian installed.")
-    print(f"Service: {service_path}")
+    print(f"Service: {service_path} ({'started' if args.start_now else 'installed but not started'})")
     if notifier_path:
         print(f"Notification bridge: {notifier_path}")
     print(f"Profile: {args.profile}")
     print(f"Guardian: {'enabled' if args.guardian else 'disabled'}")
     print(f"Notification bridge: {'enabled' if args.notifier else 'disabled'}")
-    print("Check status with: python3 -m meridian_stabilizer service-status")
+    if args.start_now:
+        print("Check status with: python3 -m meridian_stabilizer service-status")
+    else:
+        print("No shaping is active yet. Run doctor first, then start explicitly when ready.")
     return 0
 
 
@@ -1002,6 +1043,20 @@ def _route_changed(state: StabilizerState, snapshot: RuntimeSnapshot) -> bool:
     if not snapshot.route:
         return False
     return snapshot.route.interface != state.interface or snapshot.route.gateway != state.gateway
+
+
+def _post_apply_safety_failure(snapshot: RuntimeSnapshot) -> str | None:
+    if snapshot.route is None:
+        return "default route disappeared after applying shaping"
+    if snapshot.internet_ping is None:
+        return "internet probe failed after applying shaping"
+    if snapshot.internet_ping.received == 0:
+        return "internet probe received no replies after applying shaping"
+    if snapshot.internet_ping.loss_percent >= 80.0:
+        return f"internet packet loss reached {snapshot.internet_ping.loss_percent:.1f}% after applying shaping"
+    if snapshot.internet_ping.avg_ms is not None and snapshot.internet_ping.avg_ms >= 1500.0:
+        return f"average internet latency reached {snapshot.internet_ping.avg_ms:.1f} ms after applying shaping"
+    return None
 
 
 def _ping_line(stats: PingStats) -> str:
