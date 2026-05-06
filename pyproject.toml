@@ -1,0 +1,15 @@
+[project]
+name = "meridian-hotspot-stabilizer"
+version = "0.1.0"
+description = "macOS hotspot bandwidth stabilizer using PF dummynet shaping."
+requires-python = ">=3.11"
+authors = [{ name = "Meridian Internet" }]
+readme = "README.md"
+license = { text = "MIT" }
+
+[project.scripts]
+meridian-stabilizer = "meridian_stabilizer.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
