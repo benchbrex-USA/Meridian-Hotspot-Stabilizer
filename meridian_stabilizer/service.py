@@ -9,22 +9,24 @@ from .constants import PLIST_LABEL, PLIST_PATH, default_state_dir, project_root
 from .system import CommandRunner
 
 
-def build_launchd_plist(profile: str = "calls", interval: int = 60) -> dict[str, object]:
+def build_launchd_plist(profile: str = "calls", interval: int = 60, guardian: bool = False) -> dict[str, object]:
     state_dir = default_state_dir()
     python = Path(sys.executable)
+    program_arguments = [
+        str(python),
+        "-m",
+        "meridian_stabilizer",
+        "run",
+        "--profile",
+        profile,
+        "--interval",
+        str(interval),
+    ]
+    if guardian:
+        program_arguments.append("--guardian")
     return {
         "Label": PLIST_LABEL,
-        "ProgramArguments": [
-            str(python),
-            "-m",
-            "meridian_stabilizer",
-            "start",
-            "--profile",
-            profile,
-            "--watch",
-            "--interval",
-            str(interval),
-        ],
+        "ProgramArguments": program_arguments,
         "WorkingDirectory": str(project_root()),
         "EnvironmentVariables": {
             "MERIDIAN_STATE_DIR": str(state_dir),
@@ -37,11 +39,11 @@ def build_launchd_plist(profile: str = "calls", interval: int = 60) -> dict[str,
     }
 
 
-def install_service(profile: str = "calls", interval: int = 60, runner: CommandRunner | None = None) -> Path:
+def install_service(profile: str = "calls", interval: int = 60, runner: CommandRunner | None = None, guardian: bool = False) -> Path:
     runner = runner or CommandRunner()
     state_dir = default_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
-    plist = build_launchd_plist(profile=profile, interval=interval)
+    plist = build_launchd_plist(profile=profile, interval=interval, guardian=guardian)
     with tempfile.NamedTemporaryFile("wb", delete=False) as handle:
         plistlib.dump(plist, handle)
         temp_path = Path(handle.name)
@@ -63,4 +65,3 @@ def uninstall_service(runner: CommandRunner | None = None) -> Path:
     runner.run(["launchctl", "bootout", "system", str(PLIST_PATH)], privileged=True, check=False, timeout=30)
     runner.run(["rm", "-f", str(PLIST_PATH)], privileged=True, timeout=30)
     return PLIST_PATH
-

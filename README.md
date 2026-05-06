@@ -36,6 +36,7 @@ There is no web app to secure, no synthetic demo environment, and no pretend tel
 | Shaper | PF anchor and dummynet pipes owned only by Meridian. |
 | State | JSON state, SQLite metrics/events, local logs. |
 | Agent Layer | Local AI-operator handoff that exports real Meridian context without storing provider credentials. |
+| Guardian | Background safety monitor that can shut Meridian down, notify macOS, and write an incident report. |
 
 ## Architecture
 
@@ -60,6 +61,10 @@ flowchart TD
     F -.-> F1["Codex CLI: user-managed session"]
     F -.-> F2["Claude CLI: user-managed session"]
     F -.-> F3["No Meridian-managed keys or passwords"]
+    A --> G["Guardian Monitor"]
+    G --> G1["auto-shutdown on dangerous conditions"]
+    G --> G2["macOS notification attempt"]
+    G --> G3["incident report"]
 ```
 
 ## Trust Contract
@@ -76,6 +81,7 @@ Meridian should be boring where network software must be boring.
 | Clear failure | Missing metrics are printed as `unavailable`; they are not guessed. |
 | Emergency rollback | `panic` clears owned PF/dnctl state and marks Meridian inactive. |
 | Account safety | AI integrations use provider-managed local sessions; Meridian does not log in, store keys, or store passwords. |
+| Guardian authority | Guardian can only clear Meridian-owned shaping and mark Meridian inactive; it cannot change unrelated PF state. |
 
 Current boundary: this repository is a production-grade CLI foundation. It is not yet a signed macOS package with a signed privileged helper. Privileged shaping is currently sudo-backed.
 
@@ -122,6 +128,53 @@ Agent work stays bounded:
 | Recommend commands | Allowed as text unless the user explicitly runs the command. |
 | Apply shaping | Must go through existing `start`, `tune`, `stop`, or `panic` paths. |
 | Store secrets | Not allowed. |
+
+## Guardian Mode
+
+Guardian mode is the safety loop for unattended background operation.
+
+It watches real local measurements and shuts Meridian down when a defined danger condition appears. When it shuts down, it clears Meridian-owned PF/dnctl state, writes a local incident report, records an event, and attempts to show a macOS notification saying Meridian was shut down because of a problem.
+
+Danger conditions include:
+
+- repeated missing default route
+- repeated failed internet probes
+- severe internet packet loss
+- severe average latency
+- severe jitter
+- unstable Mac-to-hotspot gateway loss
+
+Run one guardian check:
+
+```sh
+python3 -m meridian_stabilizer guardian --once
+```
+
+Run guardian continuously:
+
+```sh
+python3 -m meridian_stabilizer guardian
+```
+
+Run the stabilizer and guardian together in the foreground:
+
+```sh
+python3 -m meridian_stabilizer run --profile calls --guardian
+```
+
+Install one background service with guardian enabled:
+
+```sh
+python3 -m meridian_stabilizer install-service --profile calls --guardian
+```
+
+Incident reports are written under:
+
+```text
+~/.meridian-hotspot-stabilizer/incidents/
+```
+
+The incident report explains what happened, which measured fields triggered shutdown, and what to do next. Notification delivery depends on macOS allowing `osascript` notifications from the process context; if notification delivery fails, the incident is still recorded locally.
 
 ## Install
 
@@ -198,6 +251,7 @@ python3 -m meridian_stabilizer panic
 | `events` | Shows stored operational events. |
 | `report` | Produces a real-data local diagnostic report. |
 | `agents` | Detects local AI provider CLIs or exports real Meridian context for a user-managed AI session. |
+| `guardian` | Monitors real conditions and auto-shuts Meridian down when safety thresholds are crossed. |
 | `stop` | Removes Meridian-owned shaping. |
 | `panic` | Fast rollback path for owned shaping and local active state. |
 | `install-service` | Installs the launchd-backed CLI watcher. |
@@ -277,13 +331,19 @@ Install the launchd-backed watcher:
 python3 -m meridian_stabilizer install-service --profile calls --interval 60
 ```
 
+Install the watcher with guardian auto-shutdown:
+
+```sh
+python3 -m meridian_stabilizer install-service --profile calls --interval 60 --guardian
+```
+
 Remove it:
 
 ```sh
 python3 -m meridian_stabilizer uninstall-service
 ```
 
-The service runs the same CLI engine as `run`. It records real samples and events into SQLite and uses the same owned PF/dnctl cleanup path.
+The service runs the same CLI engine as `run`. It records real samples and events into SQLite and uses the same owned PF/dnctl cleanup path. With `--guardian`, it can shut itself down on dangerous measured conditions and write an incident report.
 
 ## Production Operations
 

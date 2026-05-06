@@ -11,6 +11,7 @@ from dataclasses import asdict
 from .agents import build_agent_context, detect_providers, render_agent_context_markdown
 from .constants import APP_TITLE, ANCHOR, DOWNLOAD_PIPE, UPLOAD_PIPE
 from .database import MetricsDB, StoredSample
+from .guardian import GuardianDecision, GuardianPolicy, evaluate_guardian, write_incident_report
 from .health import score_link
 from .measurements import (
     CommandError,
@@ -25,6 +26,7 @@ from .preflight import preflight_ok, run_preflight
 from .service import install_service, uninstall_service
 from .state import StabilizerState, StateStore, utc_now
 from .system import CommandRunner, Shaper, SystemCommandError, build_pf_rules
+from .notifier import notify
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -68,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--interval", type=int, default=60, help="Adaptive tune interval in seconds.")
     run.add_argument("--target", default="1.1.1.1", help="Internet probe target for ping diagnostics.")
     run.add_argument("--quality-every", type=int, default=900, help="Run networkQuality every N seconds while watching.")
+    add_guardian_args(run, include_enable=True)
     run.set_defaults(func=cmd_run)
 
     stop = sub.add_parser("stop", help="Remove this tool's PF/dnctl rules.")
@@ -113,9 +116,19 @@ def build_parser() -> argparse.ArgumentParser:
     agents.add_argument("--target", default="1.1.1.1", help="Internet probe target for live context.")
     agents.set_defaults(func=cmd_agents)
 
+    guardian = sub.add_parser("guardian", help="Monitor Meridian and auto-shutdown on dangerous real conditions.")
+    guardian.add_argument("--interval", type=int, default=30, help="Guardian check interval in seconds.")
+    guardian.add_argument("--target", default="1.1.1.1", help="Internet probe target.")
+    guardian.add_argument("--once", action="store_true", help="Run one guardian check and exit.")
+    guardian.add_argument("--dry-run", action="store_true", help="Report shutdown decisions without clearing shaping.")
+    guardian.add_argument("--no-notify", action="store_true", help="Do not attempt macOS notifications.")
+    add_guardian_args(guardian, include_enable=False)
+    guardian.set_defaults(func=cmd_guardian)
+
     svc = sub.add_parser("install-service", help="Install and start the CLI watcher as a privileged launchd service.")
     svc.add_argument("--profile", default="calls", choices=profile_names())
     svc.add_argument("--interval", type=int, default=60, help="Background tune interval in seconds.")
+    svc.add_argument("--guardian", action="store_true", help="Run the background service with guardian auto-shutdown enabled.")
     svc.add_argument("--dry-run", action="store_true", help="Show install commands without applying them.")
     svc.set_defaults(func=cmd_install_service)
 
@@ -134,6 +147,16 @@ def add_start_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-measure", action="store_true", help="Use fallback or provided caps without networkQuality.")
     parser.add_argument("--skip-preflight", action="store_true", help="Skip startup preflight checks.")
     parser.add_argument("--dry-run", action="store_true", help="Show commands and rules without applying them.")
+
+
+def add_guardian_args(parser: argparse.ArgumentParser, include_enable: bool) -> None:
+    if include_enable:
+        parser.add_argument("--guardian", action="store_true", help="Enable guardian auto-shutdown while running.")
+    parser.add_argument("--max-loss", type=float, default=5.0, help="Guardian shutdown threshold for internet packet loss percent.")
+    parser.add_argument("--max-latency", type=float, default=500.0, help="Guardian shutdown threshold for average internet latency in ms.")
+    parser.add_argument("--max-jitter", type=float, default=250.0, help="Guardian shutdown threshold for internet jitter in ms.")
+    parser.add_argument("--max-gateway-loss", type=float, default=50.0, help="Guardian shutdown threshold for Mac-to-hotspot packet loss percent.")
+    parser.add_argument("--max-probe-failures", type=int, default=3, help="Guardian shutdown threshold for consecutive route/internet probe failures.")
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -238,7 +261,17 @@ def cmd_start(args: argparse.Namespace) -> int:
         return 0
 
     if args.watch:
-        return watch_loop(state, store, db, interval=max(15, args.interval), target=getattr(args, "target", "1.1.1.1"), quality_every=getattr(args, "quality_every", 900))
+        guardian_enabled = bool(getattr(args, "guardian", False))
+        return watch_loop(
+            state,
+            store,
+            db,
+            interval=max(15, args.interval),
+            target=getattr(args, "target", "1.1.1.1"),
+            quality_every=getattr(args, "quality_every", 900),
+            guardian_policy=_guardian_policy_from_args(args) if guardian_enabled else None,
+            notify_user=True,
+        )
     return 0
 
 
@@ -468,15 +501,93 @@ def cmd_agents(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_guardian(args: argparse.Namespace) -> int:
+    store = StateStore()
+    db = MetricsDB()
+    policy = _guardian_policy_from_args(args)
+    consecutive_failures = 0
+    print(f"{APP_TITLE} guardian")
+    print("Monitoring real local measurements. Shutdowns clear only Meridian-owned PF/dnctl state.")
+    while True:
+        state = store.load()
+        snapshot = collect_runtime_snapshot(include_quality=False, ping_count=4, target=args.target)
+        if snapshot.route is None or snapshot.internet_ping is None:
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 0
+        decision = evaluate_guardian(snapshot, state, policy, consecutive_failures=consecutive_failures)
+        db.record_sample(state, snapshot.route, snapshot.gateway_ping, snapshot.internet_ping, snapshot.quality)
+        print(f"{utc_now()} {decision.severity}: {decision.reason}")
+        if decision.action == "shutdown":
+            _guardian_shutdown(store, db, state, snapshot, decision, dry_run=args.dry_run, notify_user=not args.no_notify)
+            return 2 if not args.dry_run else 0
+        if args.once:
+            return 0
+        time.sleep(max(5, args.interval))
+
+
+def _guardian_policy_from_args(args: argparse.Namespace) -> GuardianPolicy:
+    return GuardianPolicy(
+        max_loss_percent=args.max_loss,
+        max_avg_latency_ms=args.max_latency,
+        max_jitter_ms=args.max_jitter,
+        max_gateway_loss_percent=args.max_gateway_loss,
+        max_consecutive_probe_failures=max(1, args.max_probe_failures),
+    )
+
+
+def _guardian_shutdown(
+    store: StateStore,
+    db: MetricsDB,
+    state: StabilizerState,
+    snapshot: RuntimeSnapshot,
+    decision: GuardianDecision,
+    dry_run: bool,
+    notify_user: bool,
+) -> None:
+    if dry_run:
+        print(f"Dry run: guardian would shut down Meridian: {decision.reason}")
+        return
+
+    Shaper().clear(pf_token=state.pf_token)
+    state.active = False
+    state.pf_token = None
+    state.run_pid = None
+    state.last_action = f"guardian shutdown: {decision.reason}"
+    state.stopped_at = utc_now()
+    store.save(state)
+    incident_md, incident_json = write_incident_report(store.incident_dir, decision, snapshot, state)
+    notification_ok = False
+    notification_error = None
+    if notify_user:
+        notification_ok, notification_error = notify("Meridian shut down", f"{decision.reason}. Report: {incident_md.name}")
+    db.record_event(
+        "guardian-shutdown",
+        decision.reason,
+        {
+            "severity": decision.severity,
+            "incident_report": str(incident_md),
+            "incident_json": str(incident_json),
+            "notification_ok": notification_ok,
+            "notification_error": notification_error,
+        },
+    )
+    print("Guardian shut down Meridian.")
+    print(f"Reason: {decision.reason}")
+    print(f"Incident report: {incident_md}")
+    if notify_user and not notification_ok:
+        print(f"Notification unavailable: {notification_error}")
+
+
 def cmd_install_service(args: argparse.Namespace) -> int:
     runner = CommandRunner(dry_run=args.dry_run)
-    path = install_service(profile=args.profile, interval=max(15, args.interval), runner=runner)
+    path = install_service(profile=args.profile, interval=max(15, args.interval), runner=runner, guardian=args.guardian)
     if args.dry_run:
         print("Dry run: service install commands prepared:")
         for command in runner.commands:
             print("  " + " ".join(command))
     else:
-        MetricsDB().record_event("service-install", "launchd service installed", {"path": str(path), "profile": args.profile, "interval": args.interval})
+        MetricsDB().record_event("service-install", "launchd service installed", {"path": str(path), "profile": args.profile, "interval": args.interval, "guardian": args.guardian})
         print(f"Installed and started launchd service: {path}")
     return 0
 
@@ -496,21 +607,41 @@ def cmd_uninstall_service(args: argparse.Namespace) -> int:
     return 0
 
 
-def watch_loop(state: StabilizerState, store: StateStore, db: MetricsDB, interval: int, target: str, quality_every: int) -> int:
+def watch_loop(
+    state: StabilizerState,
+    store: StateStore,
+    db: MetricsDB,
+    interval: int,
+    target: str,
+    quality_every: int,
+    guardian_policy: GuardianPolicy | None = None,
+    notify_user: bool = True,
+) -> int:
     logging.info("watch loop started with interval=%s target=%s quality_every=%s", interval, target, quality_every)
     db.record_event("watch-start", "foreground adaptive watcher started", {"pid": os.getpid(), "interval": interval, "target": target})
     last_quality_at = time.monotonic()
+    consecutive_failures = 0
     try:
         while True:
             include_quality = quality_every > 0 and time.monotonic() - last_quality_at >= quality_every
             snapshot = collect_runtime_snapshot(include_quality=include_quality, ping_count=6, target=target)
             if include_quality:
                 last_quality_at = time.monotonic()
+            if snapshot.route is None or snapshot.internet_ping is None:
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
             route_changed = _route_changed(state, snapshot)
             if route_changed and snapshot.route:
                 db.record_event("route-change", "default route changed", {"old_interface": state.interface, "new_interface": snapshot.route.interface, "old_gateway": state.gateway, "new_gateway": snapshot.route.gateway})
                 state.interface = snapshot.route.interface
                 state.gateway = snapshot.route.gateway
+
+            if guardian_policy is not None:
+                guardian_decision = evaluate_guardian(snapshot, state, guardian_policy, consecutive_failures=consecutive_failures)
+                if guardian_decision.action == "shutdown":
+                    _guardian_shutdown(store, db, state, snapshot, guardian_decision, dry_run=False, notify_user=notify_user)
+                    return 2
 
             decision = tune_caps(state, snapshot.internet_ping, quality=snapshot.quality, profile=get_profile(state.profile))
             should_apply = decision.action != "held" or route_changed

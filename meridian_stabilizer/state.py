@@ -43,6 +43,7 @@ class StateStore:
         self.state_dir = state_dir or default_state_dir()
         self.state_file = self.state_dir / "state.json"
         self.log_file = self.state_dir / "stabilizer.log"
+        self.incident_dir = self.state_dir / "incidents"
 
     def ensure_dir(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
