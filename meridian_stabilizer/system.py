@@ -62,6 +62,7 @@ class Shaper:
 
     def apply(self, interface: str, caps: Caps, existing_pf_token: str | None = None) -> str | None:
         validate_interface_name(interface)
+        validate_caps(caps)
         self._dry_run_rules(interface, caps)
 
         pf_token = existing_pf_token
@@ -142,6 +143,14 @@ def build_pf_rules(interface: str) -> str:
 def validate_interface_name(interface: str) -> None:
     if not re.fullmatch(r"[A-Za-z0-9_.:-]+", interface):
         raise ValueError(f"unsafe interface name: {interface!r}")
+
+
+def validate_caps(caps: Caps) -> None:
+    for name, value in (("upload", caps.upload_mbps), ("download", caps.download_mbps)):
+        if value <= 0:
+            raise ValueError(f"{name} cap must be positive")
+        if value > 10_000:
+            raise ValueError(f"{name} cap is unreasonably high: {value} Mbps")
 
 
 def parse_pf_token(output: str) -> str | None:

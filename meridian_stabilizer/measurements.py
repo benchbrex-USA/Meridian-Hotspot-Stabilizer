@@ -23,6 +23,15 @@ class Snapshot:
     quality: NetworkQuality | None
 
 
+@dataclass(frozen=True)
+class RuntimeSnapshot:
+    route: RouteInfo | None
+    gateway_ping: PingStats | None
+    internet_ping: PingStats | None
+    quality: NetworkQuality | None
+    errors: tuple[str, ...] = ()
+
+
 def run_command(args: list[str], timeout: int = 30) -> str:
     completed = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
     if completed.returncode != 0:
@@ -53,3 +62,34 @@ def collect_snapshot(include_quality: bool = True, ping_count: int = 8, target: 
     quality = run_network_quality() if include_quality else None
     return Snapshot(route=route, gateway_ping=gateway_ping, internet_ping=internet_ping, quality=quality)
 
+
+def collect_runtime_snapshot(include_quality: bool = False, ping_count: int = 4, target: str = "1.1.1.1") -> RuntimeSnapshot:
+    errors: list[str] = []
+    route: RouteInfo | None = None
+    gateway_ping: PingStats | None = None
+    internet_ping: PingStats | None = None
+    quality: NetworkQuality | None = None
+
+    try:
+        route = get_default_route()
+    except Exception as exc:
+        errors.append(f"default route unavailable: {exc}")
+
+    if route and route.gateway:
+        try:
+            gateway_ping = ping_host(route.gateway, count=ping_count, timeout=max(8, ping_count * 2))
+        except Exception as exc:
+            errors.append(f"gateway ping unavailable: {exc}")
+
+    try:
+        internet_ping = ping_host(target, count=ping_count, timeout=max(8, ping_count * 3))
+    except Exception as exc:
+        errors.append(f"internet ping unavailable: {exc}")
+
+    if include_quality:
+        try:
+            quality = run_network_quality()
+        except Exception as exc:
+            errors.append(f"networkQuality unavailable: {exc}")
+
+    return RuntimeSnapshot(route=route, gateway_ping=gateway_ping, internet_ping=internet_ping, quality=quality, errors=tuple(errors))

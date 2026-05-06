@@ -28,6 +28,9 @@ class StabilizerState:
     last_latency_avg_ms: float | None = None
     last_jitter_ms: float | None = None
     last_loss_percent: float | None = None
+    run_pid: int | None = None
+    heartbeat_at: str | None = None
+    stopped_at: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StabilizerState":
