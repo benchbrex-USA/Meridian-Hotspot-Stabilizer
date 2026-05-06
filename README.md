@@ -489,15 +489,15 @@ Run a syntax-only shaper dry run:
 PYTHONDONTWRITEBYTECODE=1 python3 -m meridian_stabilizer start --profile calls --dry-run
 ```
 
-## What Is Not Done Yet
+## Production Hardening Roadmap
 
-The remaining production milestones are intentionally unglamorous:
+Meridian's roadmap is focused on the work that turns a strong local engine into a Mac product people can install, trust, and forget about:
 
-- attach real Apple Developer ID Installer credentials and notarize release packages
-- replace sudo-backed privileged operations with a signed native helper that preserves `helper-contract`
-- expand launchd lifecycle tests across clean install, upgrade, uninstall, sleep/wake, and crash recovery
+- sign and notarize release packages with real Apple Developer ID Installer credentials
+- ship a signed native privileged helper that preserves the `helper-contract` allowlist
+- expand launchd lifecycle coverage across clean install, upgrade, uninstall, sleep/wake, and crash recovery
 - run a field test matrix across macOS versions, hotspot carriers, Wi-Fi hotspot, USB tethering, VPN, and poor-signal conditions
-- add deeper per-application traffic awareness where macOS exposes reliable signals
+- deepen per-application traffic awareness where macOS exposes reliable signals
 - complete external security review of privileged shaping and diagnostic bundle handling
 
 Meridian's standard is simple: real measurements, narrow system ownership, explicit rollback, no invented data.
