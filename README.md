@@ -1,69 +1,85 @@
 # Meridian Hotspot Stabilizer
 
-Meridian Hotspot Stabilizer is a macOS CLI for making phone-hotspot internet more usable under unstable cellular conditions. It measures the active link, detects bufferbloat symptoms, and applies conservative PF/dummynet traffic shaping so latency-sensitive work stays responsive when the hotspot is under load.
+> Speed tests flatter bad links. Calls expose them.
 
-Meridian is intentionally honest about the physics: it does not manufacture carrier bandwidth, bypass tower congestion, or turn a weak radio signal into a strong one. It improves the part the laptop can control: queue pressure, upload saturation, recovery behavior, and operator visibility.
+Meridian Hotspot Stabilizer is a macOS CLI for turning an unstable phone hotspot into a more predictable working link. It watches the real path your Mac is using, measures latency and queue pressure, and applies conservative PF/dummynet shaping before the hotspot turns upload bursts into seconds of lag.
 
-There is no demo mode. There is no fake dashboard data. Every metric printed by the CLI comes from local system commands or the local SQLite history written by prior real runs. If a value cannot be measured, Meridian prints `unavailable`.
-
-## What It Solves
-
-Phone hotspots often look fast in a raw speed test but feel terrible during calls because upload traffic fills queues between the Mac, phone, carrier, and upstream network. That queueing delay shows up as jitter, stalls, robotic audio, frozen video, slow DNS, and remote desktop lag.
-
-Meridian attacks that failure mode by keeping the laptop slightly below the point where the hotspot link starts buffering aggressively. The result is usually lower latency under load, fewer spikes, and a more stable working connection at the cost of some peak throughput.
-
-## System Design
+It is not a booster. It is not a carrier hack. It is not a fake dashboard wrapped around optimistic numbers. Meridian is a local control system for the part of the network your Mac can actually influence.
 
 ```text
-meridian-stabilizer CLI
-        |
-        v
-measurement layer
-  - route
-  - ping
-  - networkQuality
-        |
-        v
-policy engine
-  - profiles
-  - stability scoring
-  - adaptive cap decisions
-        |
-        v
-system shaper
-  - PF anchor: com.apple/meridian-hotspot-stabilizer
-  - dummynet pipes: owned Meridian pipe IDs only
-        |
-        v
-local state
-  - JSON state
-  - SQLite metrics and events
-  - local logs
+Goal: fewer freezes, lower jitter, cleaner calls, safer recovery.
+Trade: give up some peak throughput to protect responsiveness.
+Rule: if Meridian cannot measure a value, it says unavailable.
 ```
 
-The project is CLI-first by design. The dashboard is a terminal dashboard, not a web app. The background mode is launchd-backed, but it still runs the same CLI engine.
+## The Idea
 
-## Safety Model
+Most hotspot problems are not raw speed problems. They are queueing problems.
 
-Meridian is built around narrow ownership boundaries.
+A cellular link can show hundreds of Mbps in a test and still make a meeting unusable when a sync client, browser upload, or background process fills the upstream queue. Once that queue is full, every packet waits behind it: audio, video, DNS, SSH, remote desktop, everything.
 
-- It does not edit `/etc/pf.conf`.
-- It loads rules into a dedicated PF anchor: `com.apple/meridian-hotspot-stabilizer`.
-- It uses dedicated dummynet pipe IDs owned by Meridian.
-- `stop` and `panic` remove only Meridian-owned PF/dnctl state.
-- `preflight` validates the current route, required macOS commands, and generated PF/dnctl syntax before shaping.
-- `doctor` and `dashboard` can run without changing network shaping rules.
-- Privileged operations are explicit and use `sudo` when system shaping is required.
+Meridian keeps the Mac below that cliff. It measures the link, chooses caps with profile-specific headroom, watches jitter and loss, and adjusts gradually. The product is built around one operational belief:
 
-Current production boundary: Meridian is a hardened CLI foundation, not yet a signed macOS installer with a signed privileged helper. Until that layer exists, privileged operations remain sudo-backed.
+> A stable 25 Mbps link often beats an unstable 300 Mbps link.
 
-## Installation
+## Product Shape
+
+Meridian is CLI-first on purpose.
+
+There is no web app to secure, no synthetic demo environment, and no pretend telemetry. The CLI is the product surface, the operator console, the service entrypoint, and the diagnostic tool.
+
+| Layer | Responsibility |
+| --- | --- |
+| CLI | Operator commands, dashboard, reports, service entrypoint. |
+| Measurement | `route`, `ping`, `networkQuality`, live interface and gateway detection. |
+| Policy | Profiles, stability score, cap selection, adaptive tuning. |
+| Shaper | PF anchor and dummynet pipes owned only by Meridian. |
+| State | JSON state, SQLite metrics/events, local logs. |
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A["meridian-stabilizer CLI"] --> B["Measurement Layer"]
+    B --> B1["route: active interface and gateway"]
+    B --> B2["ping: gateway and internet latency"]
+    B --> B3["networkQuality: capacity and responsiveness"]
+    B --> C["Policy Engine"]
+    C --> C1["profiles: calls, gaming, downloads, auto"]
+    C --> C2["stability scoring"]
+    C --> C3["adaptive cap decisions"]
+    C --> D["System Shaper"]
+    D --> D1["PF anchor: com.apple/meridian-hotspot-stabilizer"]
+    D --> D2["dummynet pipes: Meridian-owned IDs"]
+    C --> E["Local Evidence Store"]
+    E --> E1["state.json"]
+    E --> E2["metrics.sqlite3"]
+    E --> E3["stabilizer.log"]
+```
+
+## Trust Contract
+
+Meridian should be boring where network software must be boring.
+
+| Contract | Implementation |
+| --- | --- |
+| No fake data | Dashboard, reports, events, and recommendations use live local measurements or prior real local samples. |
+| No silent global edits | Meridian does not edit `/etc/pf.conf`. |
+| Narrow ownership | Rules are loaded into `com.apple/meridian-hotspot-stabilizer`; cleanup targets Meridian-owned pipes and anchor state. |
+| Read-only inspection | `preflight`, `doctor`, `profiles`, `dashboard`, `events`, and `report` do not apply shaping rules. |
+| Explicit privilege | Shaping, stopping, service install, and service uninstall use privileged system commands only when required. |
+| Clear failure | Missing metrics are printed as `unavailable`; they are not guessed. |
+| Emergency rollback | `panic` clears owned PF/dnctl state and marks Meridian inactive. |
+
+Current boundary: this repository is a production-grade CLI foundation. It is not yet a signed macOS package with a signed privileged helper. Privileged shaping is currently sudo-backed.
+
+## Install
 
 Requirements:
 
 - macOS
 - Python 3.11+
-- Built-in macOS tools: `route`, `ping`, `networkQuality`, `pfctl`, `dnctl`, `launchctl`
+- Built-in macOS commands: `route`, `ping`, `networkQuality`, `pfctl`, `dnctl`, `launchctl`
 
 Run from the repository root:
 
@@ -75,47 +91,37 @@ Optional editable install:
 
 ```sh
 python3 -m pip install -e .
-```
-
-After that, the console command is available as:
-
-```sh
 meridian-stabilizer --help
 ```
 
-## Quick Start
+## First Run
 
-Run a production preflight:
+Start with inspection. This does not shape traffic.
 
 ```sh
 python3 -m meridian_stabilizer preflight
-```
-
-Inspect the current hotspot link without changing shaping:
-
-```sh
 python3 -m meridian_stabilizer doctor --profile calls
 ```
 
-Start shaping for work calls:
+Then start shaping.
 
 ```sh
 python3 -m meridian_stabilizer start --profile calls
 ```
 
-Run the adaptive tuner in the foreground:
+For an adaptive foreground session:
 
 ```sh
 python3 -m meridian_stabilizer run --profile calls
 ```
 
-Open the real terminal dashboard:
+For a real terminal dashboard:
 
 ```sh
 python3 -m meridian_stabilizer dashboard
 ```
 
-Stop shaping:
+Stop cleanly:
 
 ```sh
 python3 -m meridian_stabilizer stop
@@ -127,91 +133,94 @@ Emergency stop:
 python3 -m meridian_stabilizer panic
 ```
 
-## Command Reference
+## Operator Commands
 
-| Command | Purpose |
+| Command | Why it exists |
 | --- | --- |
-| `preflight` | Validate macOS support, required commands, active route, live ping, and PF/dnctl syntax. |
-| `profiles` | List the built-in tuning profiles. |
-| `doctor` | Run real diagnostics and recommend measured or fallback caps. |
-| `start` | Apply Meridian-owned PF/dnctl shaping rules. |
-| `run` | Start shaping and keep the adaptive tuner running in the foreground. |
-| `dashboard` | Render a live terminal dashboard using real local measurements. |
-| `tune` | Measure the current link and adjust active caps. |
-| `status` | Print stored state, last metrics, and optional system shaper state. |
-| `events` | Show local real events recorded by Meridian. |
-| `report` | Print or export a local real-data diagnostic report. |
-| `stop` | Remove Meridian-owned shaping rules. |
-| `panic` | Emergency stop that clears owned rules and marks Meridian inactive. |
-| `install-service` | Install the launchd-backed CLI watcher. |
-| `uninstall-service` | Remove the launchd service. |
+| `preflight` | Proves the machine can run Meridian before shaping anything. |
+| `doctor` | Measures the current link and explains what Meridian can use. |
+| `profiles` | Shows the tuning posture for calls, gaming, downloads, and auto mode. |
+| `start` | Applies the current profile once. |
+| `run` | Applies shaping and keeps tuning in the foreground. |
+| `dashboard` | Live terminal view backed by real measurements. |
+| `tune` | Takes a fresh measurement and updates active caps. |
+| `status` | Reads local state and optionally system PF/dnctl state. |
+| `events` | Shows stored operational events. |
+| `report` | Produces a real-data local diagnostic report. |
+| `stop` | Removes Meridian-owned shaping. |
+| `panic` | Fast rollback path for owned shaping and local active state. |
+| `install-service` | Installs the launchd-backed CLI watcher. |
+| `uninstall-service` | Removes the launchd service. |
 
 ## Profiles
 
-Meridian ships with four explicit operating profiles:
+Profiles are not themes. They encode the product's tuning posture.
 
-- `calls`: protects video calls and work apps from upload-driven latency spikes.
-- `gaming`: favors very low jitter and quick recovery over raw throughput.
-- `downloads`: keeps bulk transfers fast while still limiting severe bufferbloat.
-- `auto`: balanced adaptive mode for mixed browsing, calls, and downloads.
+| Profile | Bias |
+| --- | --- |
+| `calls` | Protect video calls and work apps from upload-driven latency spikes. |
+| `gaming` | Favor very low jitter and quick recovery over raw throughput. |
+| `downloads` | Preserve bulk throughput while limiting severe bufferbloat. |
+| `auto` | Balanced mode for mixed browsing, calls, and downloads. |
 
-List exact thresholds and fallback caps:
+Inspect exact thresholds:
 
 ```sh
 python3 -m meridian_stabilizer profiles
 ```
 
-## Data and Storage
-
-Meridian stores local operational data under:
-
-```text
-~/.meridian-hotspot-stabilizer/
-```
-
-Files include:
-
-- `state.json`: current active state, caps, interface, gateway, and watcher heartbeat.
-- `metrics.sqlite3`: real samples and events.
-- `stabilizer.log`: local operational logs.
-- `service.out.log` / `service.err.log`: launchd service logs when installed.
-
-No metrics are sent anywhere by this codebase. The current product is local-only.
-
 ## Real-Data Dashboard
 
-The dashboard is deliberately plain and trustworthy:
+The dashboard is intentionally terminal-native. It is built for operators, not screenshots.
 
 ```sh
 python3 -m meridian_stabilizer dashboard
 ```
 
-It shows:
+It can show only what was actually measured:
 
 - active profile and shaping state
 - active interface and gateway
-- current upload/download caps
+- upload/download caps
 - gateway latency and jitter
-- internet latency, jitter, max spike, and packet loss
-- measured capacity when `networkQuality` is requested
+- internet latency, jitter, max spike, and loss
+- `networkQuality` capacity and responsiveness when requested
 - recent local events
 - stability score derived from measured latency, jitter, loss, and responsiveness
 
-To render one sample and exit:
+Render one sample:
 
 ```sh
 python3 -m meridian_stabilizer dashboard --once
 ```
 
-To include periodic `networkQuality` capacity measurements:
+Ask for periodic capacity measurement:
 
 ```sh
 python3 -m meridian_stabilizer dashboard --quality-every 300
 ```
 
-## Background Operation
+## Evidence Store
 
-Install the launchd watcher:
+Meridian writes local evidence here:
+
+```text
+~/.meridian-hotspot-stabilizer/
+```
+
+| File | Purpose |
+| --- | --- |
+| `state.json` | Active profile, interface, gateway, caps, PF token, watcher heartbeat. |
+| `metrics.sqlite3` | Real samples and operational events. |
+| `stabilizer.log` | Local operational logs. |
+| `service.out.log` | launchd stdout when service mode is installed. |
+| `service.err.log` | launchd stderr when service mode is installed. |
+
+This codebase does not send metrics to a server. The current product is local-only.
+
+## Background Mode
+
+Install the launchd-backed watcher:
 
 ```sh
 python3 -m meridian_stabilizer install-service --profile calls --interval 60
@@ -223,19 +232,11 @@ Remove it:
 python3 -m meridian_stabilizer uninstall-service
 ```
 
-The service uses the same CLI engine as foreground `run`. It records real samples and events into the local SQLite database.
+The service runs the same CLI engine as `run`. It records real samples and events into SQLite and uses the same owned PF/dnctl cleanup path.
 
-## Operational Examples
+## Production Operations
 
-Run a full read-only inspection:
-
-```sh
-python3 -m meridian_stabilizer preflight
-python3 -m meridian_stabilizer doctor --profile calls
-python3 -m meridian_stabilizer report
-```
-
-Start cautiously with a dry run:
+Dry-run the exact shaping commands:
 
 ```sh
 python3 -m meridian_stabilizer start --profile calls --dry-run
@@ -247,7 +248,7 @@ Start with manual caps:
 python3 -m meridian_stabilizer start --profile calls --upload-mbps 8 --download-mbps 25
 ```
 
-Inspect system shaping state:
+Inspect system shaper state:
 
 ```sh
 python3 -m meridian_stabilizer status --system
@@ -267,27 +268,27 @@ Run tests:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
 ```
 
-Run a syntax-only shaping dry run:
-
-```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m meridian_stabilizer start --profile calls --dry-run
-```
-
-Compile-check the package:
+Compile-check:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m compileall -q -x '(^|/)\._' meridian_stabilizer tests
 ```
 
-## Production Roadmap
+Run a syntax-only shaper dry run:
 
-The next production hardening milestones are:
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m meridian_stabilizer start --profile calls --dry-run
+```
+
+## What Is Not Done Yet
+
+The next production milestones are intentionally unglamorous:
 
 - signed macOS `.pkg` installer
-- signed privileged helper instead of raw sudo-backed commands
-- stricter service lifecycle supervision
-- automatic diagnostic bundle generation
-- better per-application traffic awareness where macOS exposes reliable signals
-- release artifacts and reproducible build pipeline
+- signed privileged helper instead of sudo-backed operations
+- stricter launchd lifecycle supervision
+- diagnostic bundle generation
+- release artifacts and reproducible builds
+- deeper per-application traffic awareness where macOS exposes reliable signals
 
-Meridian should earn trust by being boring in the right places: real measurements, narrow system ownership, explicit failure modes, clean rollback, and no invented data.
+Meridian's standard is simple: real measurements, narrow system ownership, explicit rollback, no invented data.
