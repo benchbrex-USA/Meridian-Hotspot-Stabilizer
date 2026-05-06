@@ -171,17 +171,13 @@ Run the stabilizer and guardian together in the foreground:
 python3 -m meridian_stabilizer run --profile calls --guardian
 ```
 
-Install one background service with guardian enabled:
+Install the background stabilizer with guardian auto-shutdown and Mac notifications:
 
 ```sh
-python3 -m meridian_stabilizer install-service --profile calls --guardian
+python3 -m meridian_stabilizer install
 ```
 
-Install the service with guardian and the user notification bridge:
-
-```sh
-python3 -m meridian_stabilizer install-service --profile calls --interval 60 --guardian --with-notifier
-```
+That one command runs preflight checks, installs the launchd service, enables the `calls` profile, enables guardian shutdown, and installs the user notification bridge.
 
 Incident reports are written under:
 
@@ -206,22 +202,25 @@ Requirements:
 - Python 3.11+
 - Built-in macOS commands: `route`, `ping`, `networkQuality`, `pfctl`, `dnctl`, `launchctl`
 
-Run from the repository root:
+Run one command from the repository root:
 
 ```sh
-python3 -m meridian_stabilizer --help
+python3 -m meridian_stabilizer install
 ```
 
-Optional editable install:
+This is the production default. It installs the background watcher with guardian auto-shutdown and the user notification bridge. macOS may ask for an administrator password because Meridian installs a launchd service and applies network shaping through PF/dummynet.
+
+After installation, check it with:
 
 ```sh
-python3 -m pip install -e .
-meridian-stabilizer --help
+python3 -m meridian_stabilizer service-status
 ```
 
 ## First Run
 
-Start with inspection. This does not shape traffic.
+For normal use, the install command above is the first run.
+
+Manual inspection remains available and does not shape traffic.
 
 ```sh
 python3 -m meridian_stabilizer preflight
@@ -281,6 +280,7 @@ python3 -m meridian_stabilizer panic
 | `stop` | Removes Meridian-owned shaping. |
 | `panic` | Fast rollback path for owned shaping and local active state. |
 | `service-status` | Shows launchd state for the root service and user notification bridge. |
+| `install` | One-command production install: preflight, service, guardian, and notifications. |
 | `install-service` | Installs the launchd-backed CLI watcher. |
 | `uninstall-service` | Removes the launchd service. |
 | `install-notifier` | Installs only the user notification bridge. |
@@ -360,23 +360,13 @@ This codebase does not send metrics to a server. The current product is local-on
 
 ## Background Mode
 
-Install the launchd-backed watcher:
+The default background install is one command:
 
 ```sh
-python3 -m meridian_stabilizer install-service --profile calls --interval 60
+python3 -m meridian_stabilizer install
 ```
 
-Install the watcher with guardian auto-shutdown:
-
-```sh
-python3 -m meridian_stabilizer install-service --profile calls --interval 60 --guardian
-```
-
-Install the watcher, guardian, and notification bridge:
-
-```sh
-python3 -m meridian_stabilizer install-service --profile calls --interval 60 --guardian --with-notifier
-```
+It installs the launchd-backed watcher, enables guardian auto-shutdown, and installs the user notification bridge. Lower-level commands such as `install-service` and `install-notifier` exist for operators who need custom service control.
 
 Inspect launchd state:
 

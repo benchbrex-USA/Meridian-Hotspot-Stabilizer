@@ -157,6 +157,15 @@ def build_parser() -> argparse.ArgumentParser:
     svc_status.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     svc_status.set_defaults(func=cmd_service_status)
 
+    install = sub.add_parser("install", help="One-command production install: preflight, service, guardian, and notifications.")
+    install.add_argument("--profile", default="calls", choices=profile_names())
+    install.add_argument("--interval", type=int, default=60, help="Background tune interval in seconds.")
+    install.add_argument("--no-guardian", dest="guardian", action="store_false", help="Install without guardian auto-shutdown.")
+    install.add_argument("--no-notifier", dest="notifier", action="store_false", help="Install without the user notification bridge.")
+    install.add_argument("--skip-preflight", action="store_true", help="Skip readiness checks before installing.")
+    install.add_argument("--dry-run", action="store_true", help="Show install commands without applying them.")
+    install.set_defaults(func=cmd_install, guardian=True, notifier=True)
+
     svc = sub.add_parser("install-service", help="Install and start the CLI watcher as a privileged launchd service.")
     svc.add_argument("--profile", default="calls", choices=profile_names())
     svc.add_argument("--interval", type=int, default=60, help="Background tune interval in seconds.")
@@ -714,6 +723,49 @@ def cmd_service_status(args: argparse.Namespace) -> int:
     _print_launchd_status("Notifier", payload["notifier"])
     print()
     print(f"Queued notifications: {payload['queued_notifications']}")
+    return 0
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    if not args.skip_preflight:
+        checks = run_preflight()
+        blocked = [check for check in checks if check.required and not check.ok]
+        if blocked:
+            print("Install blocked by preflight:")
+            for check in blocked:
+                print(f"  {check.name}: {check.detail}")
+            return 1
+
+    runner = CommandRunner(dry_run=args.dry_run)
+    service_path = install_service(profile=args.profile, interval=max(15, args.interval), runner=runner, guardian=args.guardian)
+    notifier_path = install_notifier(runner=runner) if args.notifier else None
+
+    if args.dry_run:
+        print("Dry run: one-command install would run:")
+        for command in runner.commands:
+            print("  " + " ".join(command))
+        return 0
+
+    MetricsDB().record_event(
+        "install",
+        "one-command production install completed",
+        {
+            "profile": args.profile,
+            "interval": args.interval,
+            "guardian": args.guardian,
+            "notifier": args.notifier,
+            "service_path": str(service_path),
+            "notifier_path": str(notifier_path) if notifier_path else None,
+        },
+    )
+    print("Meridian installed.")
+    print(f"Service: {service_path}")
+    if notifier_path:
+        print(f"Notification bridge: {notifier_path}")
+    print(f"Profile: {args.profile}")
+    print(f"Guardian: {'enabled' if args.guardian else 'disabled'}")
+    print(f"Notification bridge: {'enabled' if args.notifier else 'disabled'}")
+    print("Check status with: python3 -m meridian_stabilizer service-status")
     return 0
 
 
