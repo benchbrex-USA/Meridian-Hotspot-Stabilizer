@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Unit tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+      - name: Compile check
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m compileall -q -x '(^|/)\._' meridian_stabilizer tests
+      - name: Readiness report
+        run: python3 -m meridian_stabilizer readiness
+
+  package:
+    runs-on: macos-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build unsigned package
+        run: python3 packaging/build_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meridian-unsigned-pkg
+          path: dist/*.pkg

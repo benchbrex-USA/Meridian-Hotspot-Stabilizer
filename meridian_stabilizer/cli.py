@@ -7,8 +7,10 @@ import os
 import sys
 import time
 from dataclasses import asdict
+from pathlib import Path
 
 from .agents import build_agent_context, detect_providers, render_agent_context_markdown
+from .bundle import create_diagnostic_bundle, release_readiness, render_readiness
 from .constants import APP_TITLE, ANCHOR, DOWNLOAD_PIPE, UPLOAD_PIPE
 from .database import MetricsDB, StoredSample
 from .guardian import GuardianDecision, GuardianPolicy, evaluate_guardian, write_incident_report
@@ -20,13 +22,14 @@ from .measurements import (
     get_default_route,
     run_network_quality,
 )
+from .notifier import drain_notifications, notify_or_queue, queued_notification_count, watch_notification_queue
 from .parsers import PingStats
 from .policy import PROFILES, Caps, get_profile, initial_caps, profile_names, tune_caps
 from .preflight import preflight_ok, run_preflight
-from .service import install_service, uninstall_service
+from .privileged import helper_contract
+from .service import install_notifier, install_service, notifier_status, service_status, uninstall_notifier, uninstall_service
 from .state import StabilizerState, StateStore, utc_now
 from .system import CommandRunner, Shaper, SystemCommandError, build_pf_rules
-from .notifier import notify
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -108,6 +111,19 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     report.set_defaults(func=cmd_report)
 
+    bundle = sub.add_parser("bundle", help="Create a local diagnostic bundle with real evidence.")
+    bundle.add_argument("--output-dir", help="Directory for the bundle; defaults to the Meridian state directory.")
+    bundle.add_argument("--live", action="store_true", help="Include a fresh live measurement.")
+    bundle.add_argument("--system", action="store_true", help="Include PF/dnctl status; may require sudo.")
+    bundle.add_argument("--target", default="1.1.1.1", help="Internet probe target for live measurements.")
+    bundle.add_argument("--limit", type=int, default=50, help="Recent sample/event limit.")
+    bundle.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    bundle.set_defaults(func=cmd_bundle)
+
+    readiness = sub.add_parser("readiness", help="Check production release prerequisites on this Mac.")
+    readiness.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    readiness.set_defaults(func=cmd_readiness)
+
     agents = sub.add_parser("agents", help="Inspect local AI agent readiness or export real context.")
     agents.add_argument("--provider", default="all", choices=["all", "codex", "claude"], help="Provider CLI to inspect.")
     agents.add_argument("--context", action="store_true", help="Print a real Meridian context bundle for an AI operator.")
@@ -125,10 +141,27 @@ def build_parser() -> argparse.ArgumentParser:
     add_guardian_args(guardian, include_enable=False)
     guardian.set_defaults(func=cmd_guardian)
 
+    incidents = sub.add_parser("incidents", help="Show guardian incident reports.")
+    incidents.add_argument("--latest", action="store_true", help="Print the latest incident report.")
+    incidents.add_argument("--limit", type=int, default=10, help="How many incident files to list.")
+    incidents.set_defaults(func=cmd_incidents)
+
+    helper = sub.add_parser("helper-contract", help="Print the signed privileged-helper allowlist contract.")
+    helper.add_argument("--interface", default="en0")
+    helper.add_argument("--upload-mbps", type=float, default=10.0)
+    helper.add_argument("--download-mbps", type=float, default=25.0)
+    helper.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    helper.set_defaults(func=cmd_helper_contract)
+
+    svc_status = sub.add_parser("service-status", help="Show launchd status for the service and notifier bridge.")
+    svc_status.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    svc_status.set_defaults(func=cmd_service_status)
+
     svc = sub.add_parser("install-service", help="Install and start the CLI watcher as a privileged launchd service.")
     svc.add_argument("--profile", default="calls", choices=profile_names())
     svc.add_argument("--interval", type=int, default=60, help="Background tune interval in seconds.")
     svc.add_argument("--guardian", action="store_true", help="Run the background service with guardian auto-shutdown enabled.")
+    svc.add_argument("--with-notifier", action="store_true", help="Also install the user launchd notification bridge.")
     svc.add_argument("--dry-run", action="store_true", help="Show install commands without applying them.")
     svc.set_defaults(func=cmd_install_service)
 
@@ -136,6 +169,21 @@ def build_parser() -> argparse.ArgumentParser:
     unsvc.add_argument("--keep-rules", action="store_true", help="Remove only the service, leaving current shaping rules in place.")
     unsvc.add_argument("--dry-run", action="store_true", help="Show commands without applying them.")
     unsvc.set_defaults(func=cmd_uninstall_service)
+
+    notifier = sub.add_parser("install-notifier", help="Install the user launchd notification bridge.")
+    notifier.add_argument("--interval", type=int, default=5, help="Queued notification drain interval.")
+    notifier.add_argument("--dry-run", action="store_true", help="Show install commands without applying them.")
+    notifier.set_defaults(func=cmd_install_notifier)
+
+    unnotifier = sub.add_parser("uninstall-notifier", help="Remove the user launchd notification bridge.")
+    unnotifier.add_argument("--dry-run", action="store_true", help="Show uninstall commands without applying them.")
+    unnotifier.set_defaults(func=cmd_uninstall_notifier)
+
+    notify_drain = sub.add_parser("notify-drain", help="Deliver queued Meridian macOS notifications from the user context.")
+    notify_drain.add_argument("--watch", action="store_true", help="Keep draining the queue.")
+    notify_drain.add_argument("--interval", type=int, default=5, help="Watch interval in seconds.")
+    notify_drain.add_argument("--limit", type=int, default=20, help="Maximum queued notifications to try in one pass.")
+    notify_drain.set_defaults(func=cmd_notify_drain)
 
     return parser
 
@@ -468,6 +516,36 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bundle(args: argparse.Namespace) -> int:
+    store = StateStore()
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else None
+    bundle = create_diagnostic_bundle(
+        store=store,
+        db=MetricsDB(),
+        output_dir=output_dir,
+        include_live=args.live,
+        include_system=args.system,
+        target=args.target,
+        limit=max(1, args.limit),
+    )
+    MetricsDB().record_event("diagnostic-bundle", "diagnostic bundle created", {"path": str(bundle.path), "include_live": args.live, "include_system": args.system})
+    if args.json:
+        print(json.dumps({"path": str(bundle.path), "manifest": bundle.manifest}, indent=2, sort_keys=True))
+    else:
+        print(f"Diagnostic bundle created: {bundle.path}")
+        print("PF token is redacted. Review the bundle before sharing it.")
+    return 0
+
+
+def cmd_readiness(args: argparse.Namespace) -> int:
+    payload = release_readiness()
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(render_readiness(payload), end="")
+    return 0
+
+
 def cmd_agents(args: argparse.Namespace) -> int:
     store = StateStore()
     db = MetricsDB()
@@ -559,8 +637,14 @@ def _guardian_shutdown(
     incident_md, incident_json = write_incident_report(store.incident_dir, decision, snapshot, state)
     notification_ok = False
     notification_error = None
+    notification_queue = None
     if notify_user:
-        notification_ok, notification_error = notify("Meridian shut down", f"{decision.reason}. Report: {incident_md.name}")
+        notification_ok, notification_error, notification_queue = notify_or_queue(
+            "Meridian shut down",
+            f"{decision.reason}. Report: {incident_md.name}",
+            reason=decision.reason,
+            state_dir=store.state_dir,
+        )
     db.record_event(
         "guardian-shutdown",
         decision.reason,
@@ -570,6 +654,7 @@ def _guardian_shutdown(
             "incident_json": str(incident_json),
             "notification_ok": notification_ok,
             "notification_error": notification_error,
+            "notification_queue": str(notification_queue) if notification_queue else None,
         },
     )
     print("Guardian shut down Meridian.")
@@ -577,18 +662,78 @@ def _guardian_shutdown(
     print(f"Incident report: {incident_md}")
     if notify_user and not notification_ok:
         print(f"Notification unavailable: {notification_error}")
+        if notification_queue:
+            print(f"Notification queued for user bridge: {notification_queue}")
+
+
+def cmd_incidents(args: argparse.Namespace) -> int:
+    store = StateStore()
+    incidents = sorted((path for path in store.incident_dir.glob("incident-*") if path.is_file()), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not incidents:
+        print("No guardian incidents recorded.")
+        return 0
+    if args.latest:
+        latest = next((path for path in incidents if path.suffix == ".md"), incidents[0])
+        print(latest.read_text(encoding="utf-8"), end="")
+        return 0
+    for path in incidents[: max(1, args.limit)]:
+        print(str(path))
+    return 0
+
+
+def cmd_helper_contract(args: argparse.Namespace) -> int:
+    contract = helper_contract(args.interface, Caps(upload_mbps=args.upload_mbps, download_mbps=args.download_mbps))
+    if args.json:
+        print(json.dumps(contract, indent=2, sort_keys=True))
+    else:
+        print("Meridian privileged-helper contract")
+        print(f"Authority: {contract['authority']}")
+        print(f"Owned anchor: {contract['owned_anchor']}")
+        print(f"Owned pipes: {', '.join(str(pipe) for pipe in contract['owned_pipes'])}")
+        print()
+        print("Forbidden:")
+        for item in contract["forbidden"]:
+            print(f"  - {item}")
+        print()
+        print("Use --json to inspect the exact allowlisted command plan.")
+    return 0
+
+
+def cmd_service_status(args: argparse.Namespace) -> int:
+    payload = {
+        "service": asdict(service_status()),
+        "notifier": asdict(notifier_status()),
+        "queued_notifications": queued_notification_count(),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    print(f"{APP_TITLE} service status")
+    _print_launchd_status("Service", payload["service"])
+    print()
+    _print_launchd_status("Notifier", payload["notifier"])
+    print()
+    print(f"Queued notifications: {payload['queued_notifications']}")
+    return 0
 
 
 def cmd_install_service(args: argparse.Namespace) -> int:
     runner = CommandRunner(dry_run=args.dry_run)
     path = install_service(profile=args.profile, interval=max(15, args.interval), runner=runner, guardian=args.guardian)
+    notifier_path = install_notifier(runner=runner) if args.with_notifier else None
     if args.dry_run:
         print("Dry run: service install commands prepared:")
         for command in runner.commands:
             print("  " + " ".join(command))
     else:
-        MetricsDB().record_event("service-install", "launchd service installed", {"path": str(path), "profile": args.profile, "interval": args.interval, "guardian": args.guardian})
+        MetricsDB().record_event(
+            "service-install",
+            "launchd service installed",
+            {"path": str(path), "profile": args.profile, "interval": args.interval, "guardian": args.guardian, "notifier_path": str(notifier_path) if notifier_path else None},
+        )
         print(f"Installed and started launchd service: {path}")
+        if notifier_path:
+            print(f"Installed user notification bridge: {notifier_path}")
     return 0
 
 
@@ -604,6 +749,47 @@ def cmd_uninstall_service(args: argparse.Namespace) -> int:
     else:
         MetricsDB().record_event("service-uninstall", "launchd service removed", {"path": str(path), "keep_rules": args.keep_rules})
         print(f"Removed launchd service: {path}")
+    return 0
+
+
+def cmd_install_notifier(args: argparse.Namespace) -> int:
+    runner = CommandRunner(dry_run=args.dry_run)
+    path = install_notifier(interval=max(2, args.interval), runner=runner)
+    if args.dry_run:
+        print("Dry run: notifier install commands prepared:")
+        for command in runner.commands:
+            print("  " + " ".join(command))
+    else:
+        MetricsDB().record_event("notifier-install", "user notification bridge installed", {"path": str(path), "interval": args.interval})
+        print(f"Installed user notification bridge: {path}")
+    return 0
+
+
+def cmd_uninstall_notifier(args: argparse.Namespace) -> int:
+    runner = CommandRunner(dry_run=args.dry_run)
+    path = uninstall_notifier(runner=runner)
+    if args.dry_run:
+        print("Dry run: notifier uninstall commands prepared:")
+        for command in runner.commands:
+            print("  " + " ".join(command))
+    else:
+        MetricsDB().record_event("notifier-uninstall", "user notification bridge removed", {"path": str(path)})
+        print(f"Removed user notification bridge: {path}")
+    return 0
+
+
+def cmd_notify_drain(args: argparse.Namespace) -> int:
+    if args.watch:
+        watch_notification_queue(interval=max(2, args.interval))
+        return 0
+    delivered = drain_notifications(limit=max(1, args.limit))
+    if not delivered:
+        print("No queued notifications.")
+        return 0
+    for item in delivered:
+        status = "delivered" if item.delivered else "failed"
+        suffix = f": {item.error}" if item.error else ""
+        print(f"{status} {item.notification.ts} {item.notification.title}{suffix}")
     return 0
 
 
@@ -737,6 +923,19 @@ def _render_dashboard(state: StabilizerState, snapshot: RuntimeSnapshot, sample:
         print("Recent real events")
         for event in events:
             print(f"  {event.ts} {event.kind}: {event.message}")
+
+
+def _print_launchd_status(label: str, payload: dict[str, object]) -> None:
+    print(f"{label}:")
+    print(f"  label: {payload['label']}")
+    print(f"  domain: {payload['domain']}")
+    print(f"  plist: {payload['plist_path']} ({'exists' if payload['plist_exists'] else 'missing'})")
+    print(f"  state: {payload['state'] or 'unavailable'}")
+    print(f"  pid: {payload['pid'] or 'unavailable'}")
+    print(f"  runs: {payload['runs'] if payload['runs'] is not None else 'unavailable'}")
+    print(f"  last exit: {payload['last_exit_code'] if payload['last_exit_code'] is not None else 'unavailable'}")
+    if payload["print_returncode"] != 0:
+        print(f"  launchctl: unavailable ({payload['stderr'] or 'not loaded'})")
 
 
 def _update_state_metrics(state: StabilizerState, snapshot: RuntimeSnapshot) -> None:

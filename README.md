@@ -37,6 +37,9 @@ There is no web app to secure, no synthetic demo environment, and no pretend tel
 | State | JSON state, SQLite metrics/events, local logs. |
 | Agent Layer | Local AI-operator handoff that exports real Meridian context without storing provider credentials. |
 | Guardian | Background safety monitor that can shut Meridian down, notify macOS, and write an incident report. |
+| Notification Bridge | User launchd agent that drains queued macOS notifications when root/background delivery is blocked. |
+| Diagnostic Bundle | Local tarball with redacted state, metrics, service status, logs, incidents, and optional live measurements. |
+| Release Tooling | macOS package builder with signing/notarization hooks for Developer ID credentials. |
 
 ## Architecture
 
@@ -63,8 +66,12 @@ flowchart TD
     F -.-> F3["No Meridian-managed keys or passwords"]
     A --> G["Guardian Monitor"]
     G --> G1["auto-shutdown on dangerous conditions"]
-    G --> G2["macOS notification attempt"]
+    G --> G2["macOS notification or queued delivery"]
     G --> G3["incident report"]
+    A --> H["Production Tooling"]
+    H --> H1["diagnostic bundles"]
+    H --> H2["readiness checks"]
+    H --> H3["pkg build/sign/notarize path"]
 ```
 
 ## Trust Contract
@@ -82,8 +89,10 @@ Meridian should be boring where network software must be boring.
 | Emergency rollback | `panic` clears owned PF/dnctl state and marks Meridian inactive. |
 | Account safety | AI integrations use provider-managed local sessions; Meridian does not log in, store keys, or store passwords. |
 | Guardian authority | Guardian can only clear Meridian-owned shaping and mark Meridian inactive; it cannot change unrelated PF state. |
+| Shareable evidence | `bundle` redacts the PF token and packages local diagnostics for review. |
+| Background notifications | Root-context notification failures are queued for a user launchd bridge instead of being silently lost. |
 
-Current boundary: this repository is a production-grade CLI foundation. It is not yet a signed macOS package with a signed privileged helper. Privileged shaping is currently sudo-backed.
+Current boundary: this repository now has release tooling for macOS packages, readiness checks, diagnostic bundles, and a privileged-helper contract. Real Developer ID signing and notarization require your Apple Developer credentials. Privileged shaping is still sudo-backed until the signed native helper is implemented.
 
 ## AI Operator Handoff
 
@@ -168,13 +177,26 @@ Install one background service with guardian enabled:
 python3 -m meridian_stabilizer install-service --profile calls --guardian
 ```
 
+Install the service with guardian and the user notification bridge:
+
+```sh
+python3 -m meridian_stabilizer install-service --profile calls --interval 60 --guardian --with-notifier
+```
+
 Incident reports are written under:
 
 ```text
 ~/.meridian-hotspot-stabilizer/incidents/
 ```
 
-The incident report explains what happened, which measured fields triggered shutdown, and what to do next. Notification delivery depends on macOS allowing `osascript` notifications from the process context; if notification delivery fails, the incident is still recorded locally.
+The incident report explains what happened, which measured fields triggered shutdown, and what to do next. If direct notification delivery fails from the privileged/background context, Meridian writes the notification into a local queue. The user notification bridge drains that queue from the logged-in macOS user context.
+
+Inspect incidents:
+
+```sh
+python3 -m meridian_stabilizer incidents
+python3 -m meridian_stabilizer incidents --latest
+```
 
 ## Install
 
@@ -250,12 +272,20 @@ python3 -m meridian_stabilizer panic
 | `status` | Reads local state and optionally system PF/dnctl state. |
 | `events` | Shows stored operational events. |
 | `report` | Produces a real-data local diagnostic report. |
+| `bundle` | Creates a redacted diagnostic tarball with local evidence, logs, service status, and incidents. |
+| `readiness` | Checks macOS release prerequisites, packaging tools, and signing identity availability. |
 | `agents` | Detects local AI provider CLIs or exports real Meridian context for a user-managed AI session. |
 | `guardian` | Monitors real conditions and auto-shuts Meridian down when safety thresholds are crossed. |
+| `incidents` | Lists or prints guardian incident reports. |
+| `helper-contract` | Prints the signed privileged-helper allowlist contract. |
 | `stop` | Removes Meridian-owned shaping. |
 | `panic` | Fast rollback path for owned shaping and local active state. |
+| `service-status` | Shows launchd state for the root service and user notification bridge. |
 | `install-service` | Installs the launchd-backed CLI watcher. |
 | `uninstall-service` | Removes the launchd service. |
+| `install-notifier` | Installs only the user notification bridge. |
+| `uninstall-notifier` | Removes only the user notification bridge. |
+| `notify-drain` | Delivers queued notifications; used by the user launchd bridge. |
 
 ## Profiles
 
@@ -320,6 +350,11 @@ Meridian writes local evidence here:
 | `stabilizer.log` | Local operational logs. |
 | `service.out.log` | launchd stdout when service mode is installed. |
 | `service.err.log` | launchd stderr when service mode is installed. |
+| `notifier.out.log` | user notification bridge stdout. |
+| `notifier.err.log` | user notification bridge stderr. |
+| `notifications.jsonl` | queued notifications awaiting user-context delivery. |
+| `incidents/` | guardian incident reports in Markdown and JSON. |
+| `bundles/` | diagnostic bundles created by `bundle`. |
 
 This codebase does not send metrics to a server. The current product is local-only.
 
@@ -337,13 +372,26 @@ Install the watcher with guardian auto-shutdown:
 python3 -m meridian_stabilizer install-service --profile calls --interval 60 --guardian
 ```
 
+Install the watcher, guardian, and notification bridge:
+
+```sh
+python3 -m meridian_stabilizer install-service --profile calls --interval 60 --guardian --with-notifier
+```
+
+Inspect launchd state:
+
+```sh
+python3 -m meridian_stabilizer service-status
+```
+
 Remove it:
 
 ```sh
 python3 -m meridian_stabilizer uninstall-service
+python3 -m meridian_stabilizer uninstall-notifier
 ```
 
-The service runs the same CLI engine as `run`. It records real samples and events into SQLite and uses the same owned PF/dnctl cleanup path. With `--guardian`, it can shut itself down on dangerous measured conditions and write an incident report.
+The service runs the same CLI engine as `run`. It records real samples and events into SQLite and uses the same owned PF/dnctl cleanup path. With `--guardian`, it can shut itself down on dangerous measured conditions, write an incident report, record an event, and queue a macOS notification if direct delivery is blocked.
 
 ## Production Operations
 
@@ -371,6 +419,56 @@ Export a machine-readable report:
 python3 -m meridian_stabilizer report --json
 ```
 
+Create a redacted diagnostic bundle:
+
+```sh
+python3 -m meridian_stabilizer bundle
+```
+
+Include fresh live measurements:
+
+```sh
+python3 -m meridian_stabilizer bundle --live
+```
+
+Check release readiness on the current Mac:
+
+```sh
+python3 -m meridian_stabilizer readiness
+```
+
+Inspect the privileged-helper allowlist contract:
+
+```sh
+python3 -m meridian_stabilizer helper-contract
+```
+
+## Release Engineering
+
+Meridian includes a macOS package build path. It can produce unsigned local packages for internal testing and signed/notarized packages when Apple Developer ID credentials are available in the environment and Keychain.
+
+Build an unsigned package:
+
+```sh
+python3 packaging/build_release.py
+```
+
+Build a signed package:
+
+```sh
+export MERIDIAN_DEVELOPER_ID_INSTALLER="Developer ID Installer: Example, Inc. (TEAMID)"
+python3 packaging/build_release.py --sign
+```
+
+Build, submit, wait for notarization, and staple:
+
+```sh
+export MERIDIAN_NOTARY_PROFILE="meridian-notary"
+python3 packaging/build_release.py --sign --notarize
+```
+
+The release workflow is intentionally credential-free in git. Apple signing identities and notary credentials must live in Keychain or CI secrets, never in source.
+
 ## Development
 
 Run tests:
@@ -393,14 +491,13 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m meridian_stabilizer start --profile calls -
 
 ## What Is Not Done Yet
 
-The next production milestones are intentionally unglamorous:
+The remaining production milestones are intentionally unglamorous:
 
-- local AI agent handoff with Codex and Claude user-managed session support
-- signed macOS `.pkg` installer
-- signed privileged helper instead of sudo-backed operations
-- stricter launchd lifecycle supervision
-- diagnostic bundle generation
-- release artifacts and reproducible builds
-- deeper per-application traffic awareness where macOS exposes reliable signals
+- attach real Apple Developer ID Installer credentials and notarize release packages
+- replace sudo-backed privileged operations with a signed native helper that preserves `helper-contract`
+- expand launchd lifecycle tests across clean install, upgrade, uninstall, sleep/wake, and crash recovery
+- run a field test matrix across macOS versions, hotspot carriers, Wi-Fi hotspot, USB tethering, VPN, and poor-signal conditions
+- add deeper per-application traffic awareness where macOS exposes reliable signals
+- complete external security review of privileged shaping and diagnostic bundle handling
 
 Meridian's standard is simple: real measurements, narrow system ownership, explicit rollback, no invented data.
