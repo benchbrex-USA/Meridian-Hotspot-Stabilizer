@@ -8,6 +8,7 @@ import sys
 import time
 from dataclasses import asdict
 
+from .agents import build_agent_context, detect_providers, render_agent_context_markdown
 from .constants import APP_TITLE, ANCHOR, DOWNLOAD_PIPE, UPLOAD_PIPE
 from .database import MetricsDB, StoredSample
 from .health import score_link
@@ -103,6 +104,14 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--limit", type=int, default=20)
     report.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     report.set_defaults(func=cmd_report)
+
+    agents = sub.add_parser("agents", help="Inspect local AI agent readiness or export real context.")
+    agents.add_argument("--provider", default="all", choices=["all", "codex", "claude"], help="Provider CLI to inspect.")
+    agents.add_argument("--context", action="store_true", help="Print a real Meridian context bundle for an AI operator.")
+    agents.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    agents.add_argument("--no-live", action="store_true", help="Do not collect fresh live measurements for context.")
+    agents.add_argument("--target", default="1.1.1.1", help="Internet probe target for live context.")
+    agents.set_defaults(func=cmd_agents)
 
     svc = sub.add_parser("install-service", help="Install and start the CLI watcher as a privileged launchd service.")
     svc.add_argument("--profile", default="calls", choices=profile_names())
@@ -423,6 +432,39 @@ def cmd_report(args: argparse.Namespace) -> int:
     print(f"Recent events: {len(payload['recent_events'])}")
     for event in payload["recent_events"][:5]:
         print(f"  {event['ts']} {event['kind']}: {event['message']}")
+    return 0
+
+
+def cmd_agents(args: argparse.Namespace) -> int:
+    store = StateStore()
+    db = MetricsDB()
+    if args.context:
+        context = build_agent_context(store.load(), db, provider=args.provider, include_live=not args.no_live, target=args.target)
+        if args.json:
+            print(json.dumps(context, indent=2, sort_keys=True))
+        else:
+            print(render_agent_context_markdown(context), end="")
+        return 0
+
+    providers = detect_providers(args.provider)
+    if args.json:
+        print(json.dumps({"providers": [asdict(provider) for provider in providers]}, indent=2, sort_keys=True))
+        return 0
+
+    print(f"{APP_TITLE} agent readiness")
+    print("Meridian does not log in, store passwords, store API keys, or manage provider tokens.")
+    print("Use the provider's own CLI or browser login flow, then let Meridian export real local context.")
+    print()
+    for provider in providers:
+        status = "installed" if provider.installed else "not installed"
+        path = provider.path or "unavailable"
+        print(f"{provider.name}: {status}")
+        print(f"  executable: {provider.executable}")
+        print(f"  path: {path}")
+        print(f"  auth: {provider.auth_model}")
+    print()
+    print("To export real context for an AI operator:")
+    print("  python3 -m meridian_stabilizer agents --context")
     return 0
 
 

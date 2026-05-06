@@ -35,6 +35,7 @@ There is no web app to secure, no synthetic demo environment, and no pretend tel
 | Policy | Profiles, stability score, cap selection, adaptive tuning. |
 | Shaper | PF anchor and dummynet pipes owned only by Meridian. |
 | State | JSON state, SQLite metrics/events, local logs. |
+| Agent Layer | Local AI-operator handoff that exports real Meridian context without storing provider credentials. |
 
 ## Architecture
 
@@ -55,6 +56,10 @@ flowchart TD
     E --> E1["state.json"]
     E --> E2["metrics.sqlite3"]
     E --> E3["stabilizer.log"]
+    A -.-> F["AI Agent Handoff"]
+    F -.-> F1["Codex CLI: user-managed session"]
+    F -.-> F2["Claude CLI: user-managed session"]
+    F -.-> F3["No Meridian-managed keys or passwords"]
 ```
 
 ## Trust Contract
@@ -70,8 +75,53 @@ Meridian should be boring where network software must be boring.
 | Explicit privilege | Shaping, stopping, service install, and service uninstall use privileged system commands only when required. |
 | Clear failure | Missing metrics are printed as `unavailable`; they are not guessed. |
 | Emergency rollback | `panic` clears owned PF/dnctl state and marks Meridian inactive. |
+| Account safety | AI integrations use provider-managed local sessions; Meridian does not log in, store keys, or store passwords. |
 
 Current boundary: this repository is a production-grade CLI foundation. It is not yet a signed macOS package with a signed privileged helper. Privileged shaping is currently sudo-backed.
+
+## AI Operator Handoff
+
+Meridian can work beside AI coding/operator tools without becoming a secret store or an unbounded remote-control plane.
+
+The `agents` command detects supported local provider CLIs and exports a real Meridian context bundle. That bundle contains current state, recent real samples, recent events, safety boundaries, and optional live measurements.
+
+Meridian does not authenticate to providers. Users authenticate with the provider's own official tooling, then Meridian can hand off context to that already-managed local session.
+
+Supported provider targets:
+
+- Codex CLI session, managed outside Meridian
+- Claude CLI session, managed outside Meridian
+- no Meridian-managed API keys
+- no API keys in Meridian config
+- no provider passwords in files, logs, SQLite, or git
+
+Check local AI readiness:
+
+```sh
+python3 -m meridian_stabilizer agents
+```
+
+Export a real context bundle for an AI operator:
+
+```sh
+python3 -m meridian_stabilizer agents --context
+```
+
+Export machine-readable context:
+
+```sh
+python3 -m meridian_stabilizer agents --context --json
+```
+
+Agent work stays bounded:
+
+| Agent ability | Boundary |
+| --- | --- |
+| Read diagnostics | Allowed from local real-data state, logs, and metrics. |
+| Explain decisions | Allowed, but explanations must cite measured fields or stored events. |
+| Recommend commands | Allowed as text unless the user explicitly runs the command. |
+| Apply shaping | Must go through existing `start`, `tune`, `stop`, or `panic` paths. |
+| Store secrets | Not allowed. |
 
 ## Install
 
@@ -147,6 +197,7 @@ python3 -m meridian_stabilizer panic
 | `status` | Reads local state and optionally system PF/dnctl state. |
 | `events` | Shows stored operational events. |
 | `report` | Produces a real-data local diagnostic report. |
+| `agents` | Detects local AI provider CLIs or exports real Meridian context for a user-managed AI session. |
 | `stop` | Removes Meridian-owned shaping. |
 | `panic` | Fast rollback path for owned shaping and local active state. |
 | `install-service` | Installs the launchd-backed CLI watcher. |
@@ -284,6 +335,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m meridian_stabilizer start --profile calls -
 
 The next production milestones are intentionally unglamorous:
 
+- local AI agent handoff with Codex and Claude user-managed session support
 - signed macOS `.pkg` installer
 - signed privileged helper instead of sudo-backed operations
 - stricter launchd lifecycle supervision
