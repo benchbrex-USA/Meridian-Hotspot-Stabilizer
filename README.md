@@ -237,6 +237,7 @@ Manual inspection remains available and does not shape traffic.
 ```sh
 python3 -m meridian_stabilizer preflight
 python3 -m meridian_stabilizer doctor --profile calls
+python3 -m meridian_stabilizer internet-doctor --site youtube.com --site example.com
 ```
 
 Then start shaping.
@@ -275,6 +276,7 @@ python3 -m meridian_stabilizer panic
 | --- | --- |
 | `preflight` | Proves the machine can run Meridian before shaping anything. |
 | `doctor` | Measures the current link and explains what Meridian can use. |
+| `internet-doctor` | Tests DNS, TCP, HTTPS, and page reachability for real sites without changing Mac settings. |
 | `profiles` | Shows the tuning posture for calls, gaming, downloads, and auto mode. |
 | `start` | Applies the current profile once. |
 | `run` | Applies shaping and keeps tuning in the foreground. |
@@ -314,6 +316,35 @@ Inspect exact thresholds:
 
 ```sh
 python3 -m meridian_stabilizer profiles
+```
+
+## Internet Doctor
+
+`internet-doctor` is the additive layer for the product vision: pages, videos, and websites sometimes fail even when the hotspot has good 5G speed. This command does not apply shaping, install a proxy, edit DNS, or change Mac network settings. It checks the real path in stages:
+
+- default route through the hotspot
+- internet ping reachability
+- DNS resolution for each site
+- TCP connection to the site
+- HTTPS/TLS handshake
+- HTTP page response
+
+Run the default probes:
+
+```sh
+python3 -m meridian_stabilizer internet-doctor
+```
+
+Test the exact sites or video domains that are failing:
+
+```sh
+python3 -m meridian_stabilizer internet-doctor --site youtube.com --site https://video.example.com/watch
+```
+
+Use JSON when an AI operator or support workflow needs structured evidence:
+
+```sh
+python3 -m meridian_stabilizer internet-doctor --json
 ```
 
 ## Real-Data Dashboard

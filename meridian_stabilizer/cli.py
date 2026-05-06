@@ -13,6 +13,7 @@ from .agents import build_agent_context, detect_providers, render_agent_context_
 from .bundle import create_diagnostic_bundle, release_readiness, render_readiness
 from .constants import APP_TITLE, ANCHOR, DOWNLOAD_PIPE, UPLOAD_PIPE
 from .database import MetricsDB, StoredSample
+from .diagnostics import DEFAULT_SITE_TARGETS, InternetDiagnosis, diagnose_internet, probe_site
 from .guardian import GuardianDecision, GuardianPolicy, evaluate_guardian, write_incident_report
 from .health import score_link
 from .measurements import (
@@ -55,6 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--target", default="1.1.1.1", help="Internet probe target for ping diagnostics.")
     doctor.add_argument("--profile", default="calls", choices=profile_names())
     doctor.set_defaults(func=cmd_doctor)
+
+    internet_doctor = sub.add_parser("internet-doctor", help="Diagnose page and video failures without changing Mac settings.")
+    internet_doctor.add_argument("--site", action="append", dest="sites", help="Website or URL to test; may be passed more than once.")
+    internet_doctor.add_argument("--target", default="1.1.1.1", help="Internet ping target for hotspot path checks.")
+    internet_doctor.add_argument("--timeout", type=float, default=6.0, help="Per-step site probe timeout in seconds.")
+    internet_doctor.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    internet_doctor.set_defaults(func=cmd_internet_doctor)
 
     preflight = sub.add_parser("preflight", help="Check macOS commands, route, and PF/dnctl rule syntax.")
     preflight.set_defaults(func=cmd_preflight)
@@ -236,6 +244,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     db.record_sample(state, snapshot.route, snapshot.gateway_ping, snapshot.internet_ping, snapshot.quality)
     if snapshot.errors:
         db.record_event("doctor-warning", "doctor completed with unavailable data", {"errors": list(snapshot.errors)})
+    return 0
+
+
+def cmd_internet_doctor(args: argparse.Namespace) -> int:
+    store = StateStore()
+    db = MetricsDB()
+    state = store.load()
+    targets = tuple(args.sites) if args.sites else DEFAULT_SITE_TARGETS
+    snapshot = collect_runtime_snapshot(include_quality=False, ping_count=4, target=args.target)
+    probes = tuple(probe_site(target, timeout=max(1.0, args.timeout)) for target in targets)
+    diagnosis = diagnose_internet(snapshot, probes)
+    db.record_sample(state, snapshot.route, snapshot.gateway_ping, snapshot.internet_ping, snapshot.quality)
+    db.record_event(
+        "internet-doctor",
+        diagnosis.likely_cause,
+        {
+            "sites": [probe.url for probe in probes],
+            "failed": [probe.url for probe in probes if not probe.ok],
+            "failure_stages": [probe.failure_stage for probe in probes if probe.failure_stage],
+        },
+    )
+
+    if args.json:
+        print(json.dumps({"snapshot": asdict(snapshot), "diagnosis": asdict(diagnosis)}, indent=2, sort_keys=True))
+    else:
+        _print_internet_diagnosis(snapshot, diagnosis)
     return 0
 
 
@@ -983,6 +1017,38 @@ def _print_runtime_snapshot(snapshot: RuntimeSnapshot) -> None:
         print(f"Idle latency: {_fmt_optional(latency)} ms")
     if snapshot.errors:
         print("Unavailable data:")
+        for error in snapshot.errors:
+            print(f"  {error}")
+
+
+def _print_internet_diagnosis(snapshot: RuntimeSnapshot, diagnosis: InternetDiagnosis) -> None:
+    print(f"{APP_TITLE} internet doctor")
+    print("No Mac network settings were changed.")
+    print(f"Interface: {snapshot.route.interface if snapshot.route else 'unavailable'}")
+    print(f"Gateway: {snapshot.route.gateway if snapshot.route else 'unavailable'}")
+    if snapshot.internet_ping:
+        print(f"Internet latency: {_ping_line(snapshot.internet_ping)}")
+    else:
+        print("Internet latency: unavailable")
+    print()
+    print(f"Likely cause: {diagnosis.likely_cause}")
+    print()
+    print("Site probes")
+    for probe in diagnosis.probes:
+        marker = "OK" if probe.ok else "FAIL"
+        stage = f" at {probe.failure_stage}" if probe.failure_stage else ""
+        print(f"  {marker} {probe.url}{stage}: {probe.summary}")
+        for step in probe.steps:
+            step_marker = "OK" if step.ok else "FAIL"
+            elapsed = f" ({step.elapsed_ms:.1f} ms)" if step.elapsed_ms is not None else ""
+            print(f"    {step_marker} {step.name}: {step.detail}{elapsed}")
+    print()
+    print("Next safe actions")
+    for item in diagnosis.recommendations:
+        print(f"  - {item}")
+    if snapshot.errors:
+        print()
+        print("Unavailable data")
         for error in snapshot.errors:
             print(f"  {error}")
 

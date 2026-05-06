@@ -19,6 +19,12 @@ class CliTests(unittest.TestCase):
         self.assertFalse(args.start_now)
         self.assertTrue(args.dry_run)
 
+    def test_internet_doctor_accepts_multiple_sites(self):
+        args = build_parser().parse_args(["internet-doctor", "--site", "example.com", "--site", "https://video.example"])
+
+        self.assertEqual(args.sites, ["example.com", "https://video.example"])
+        self.assertEqual(args.timeout, 6.0)
+
     def test_install_dry_run_combines_service_and_notifier(self):
         args = argparse.Namespace(profile="calls", interval=60, guardian=True, notifier=True, start_now=False, skip_preflight=True, dry_run=True)
         output = io.StringIO()
